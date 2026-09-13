@@ -57,30 +57,28 @@ class BLEWorker(QObject):
         asyncio.set_event_loop(self._loop)
         self._queue = asyncio.Queue()
         try:
-            self._loop.run_until_complete(self._connect_and_serve())
+            self._loop.run_until_complete(self._main_loop())
         finally:
             self._loop.close()
 
-    async def _connect_and_serve(self):
-        self.status.emit(f"Searching for {LED_MAC}...")
+    async def _main_loop(self):
+        while True:
+            await self._try_connect()
+            await asyncio.sleep(5.0)
+
+    async def _try_connect(self):
         try:
             device = await BleakScanner.find_device_by_address(LED_MAC, timeout=10.0)
-        except Exception as e:
-            self.status.emit(f"Scan error: {e}")
-            self.connected.emit(False)
+        except Exception:
             return
 
         if not device:
-            self.status.emit("Device not found.")
-            self.connected.emit(False)
             return
 
-        self.status.emit(f"Connecting to {device.name or LED_MAC}...")
         try:
             async with BleakClient(device) as client:
                 self._client = client
                 self.connected.emit(True)
-                self.status.emit("Connected ✔")
 
                 await client.write_gatt_char(
                     CHARACTERISTIC_UUID, bytes(_cmd_on())
@@ -95,15 +93,13 @@ class BLEWorker(QObject):
                         await client.write_gatt_char(
                             CHARACTERISTIC_UUID, bytes(cmd)
                         )
-                    except Exception as e:
-                        self.status.emit(f"Send error: {e}")
+                    except Exception:
                         break
-        except Exception as e:
-            self.status.emit(f"Connection error: {e}")
+        except Exception:
+            pass
         finally:
             self._client = None
             self.connected.emit(False)
-            self.status.emit("Disconnected")
 
     def send(self, cmd_bytes):
         if self._loop is None or self._queue is None:
@@ -321,7 +317,13 @@ class PickerWindow(QWidget):
         btn_row.addWidget(self.btn_off)
         layout.addLayout(btn_row)
 
-        self.status = QLabel("Initializing...")
+        # Connection status label
+        self.conn_label = QLabel("Connecting...")
+        self.conn_label.setStyleSheet("color: #ffaa00; font-size: 13px; font-weight: bold;")
+        self.conn_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.conn_label)
+
+        self.status = QLabel("")
         self.status.setStyleSheet("color: #888; font-size: 12px;")
         layout.addWidget(self.status)
 
@@ -362,6 +364,12 @@ class PickerWindow(QWidget):
     def _on_connection(self, ok: bool):
         self.btn_on.setEnabled(ok)
         self.btn_off.setEnabled(ok)
+        if ok:
+            self.conn_label.setText("Connected")
+            self.conn_label.setStyleSheet("color: #44dd44; font-size: 13px; font-weight: bold;")
+        else:
+            self.conn_label.setText("Reconnecting...")
+            self.conn_label.setStyleSheet("color: #ffaa00; font-size: 13px; font-weight: bold;")
 
     def closeEvent(self, event):
         event.ignore()
@@ -431,5 +439,19 @@ class App(QApplication):
 
 
 if __name__ == "__main__":
+    ascii = """
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⣶⣶⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⢸⣄⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⢰⠛⠀⠀⠹⣧⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠀⠀⠀⠀⣿⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⢠⠀⡄⠀⣿⠀⢀⣤⣤⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⢰⡏⠚⠀⠃⠀⣿⣴⠞⠉⢹⠀⠀⠀
+    ⠀⣀⡀⠀⠀⠀⠀⢀⣸⠇⠀⠀⠀⠀⠈⠀⠀⣀⡿⠀⠀⠀
+    ⢸⣟⠛⢳⣤⣤⡶⠛⠃⠀⣠⠀⠀⠀⠚⣶⡾⠟⠀⠀⠀⠀
+    ⠀⠉⢷⣤⣀⣀⣀⣀⣠⡾⠻⣧⡀⠀⠀⢘⣷⣄⣀⣤⣄⠀⠀⠀⠀
+    ⠀⠀⠀⠈⠉⠉⠉⠉⠉⠀⠀⠘⠻⣦⣤⣈⣁⣀⣠⣾⠋⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠉⠉⠉⠉⠀
+    """
+    print(ascii)
     app = App(sys.argv)
     sys.exit(app.exec())
