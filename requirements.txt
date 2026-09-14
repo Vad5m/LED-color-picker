@@ -1,0 +1,6 @@
+PyQt6>=6.5
+bleak>=0.21
+numpy>=1.24
+
+# microphone
+sounddevice>=0.4.6
