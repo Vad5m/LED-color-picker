@@ -5,15 +5,38 @@ import threading
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider,
-    QSystemTrayIcon, QMenu, QLabel, QPushButton
+    QSystemTrayIcon, QMenu, QLabel, QPushButton, QGridLayout, QButtonGroup
 )
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QFont, QConicalGradient,
     QIcon, QPixmap, QAction, QLinearGradient, QImage
 )
-from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal, QObject, QTimer
+from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal, QObject, QTimer, QSize
 
 from bleak import BleakScanner, BleakClient
+
+_SD_OK = False
+_SD_ERR = None
+try:
+    import sounddevice as sd
+    import numpy as np
+    try:
+        sd.query_devices()
+        _SD_OK = True
+    except Exception as e:
+        _SD_ERR = f"PortAudio not working: {e}"
+except OSError as e:
+    _SD_ERR = (
+        f"System library PortAudio not found: {e}\n"
+        "Install: sudo apt install libportaudio2 portaudio19-dev"
+    )
+except ImportError as e:
+    _SD_ERR = (
+        f"Python module sounddevice or numpy not installed: {e}\n"
+        "Install: pip install sounddevice numpy"
+    )
+except Exception as e:
+    _SD_ERR = f"Unknown error while importing audio: {e}"
 
 
 CHARACTERISTIC_UUID = "0000fff3-0000-1000-8000-00805f9b34fb"
@@ -119,6 +142,171 @@ class BLEWorker(QObject):
         self.send(_cmd_brightness(level))
 
 
+class MicLevelWorker(QObject):
+    levelChanged = pyqtSignal(float)
+
+    def __init__(self, samplerate=44100, blocksize=1024):
+        super().__init__()
+        self._samplerate = samplerate
+        self._blocksize = blocksize
+        self._running = False
+        self._thread = None
+        self._stream = None
+        self._smooth = 0.0
+        self._noise_floor = 0.005
+        self._gain = 60.0
+
+    @staticmethod
+    def available():
+        return _SD_OK
+
+    @staticmethod
+    def error_message():
+        return _SD_ERR
+
+    def start(self):
+        if not _SD_OK or self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _run(self):
+        try:
+            def callback(indata, frames, time_info, status):
+                if not self._running:
+                    return
+                if indata.ndim > 1:
+                    mono = indata.mean(axis=1)
+                else:
+                    mono = indata
+                rms = float(np.sqrt(np.mean(mono * mono)))
+
+                if rms < self._noise_floor:
+                    self._noise_floor = 0.95 * self._noise_floor + 0.05 * rms
+                else:
+                    self._noise_floor = 0.999 * self._noise_floor + 0.001 * rms
+
+                x = (rms - self._noise_floor) * self._gain
+                if x < 0.0:
+                    x = 0.0
+                if x > 1.0:
+                    x = 1.0
+
+                if x > self._smooth:
+                    self._smooth = 0.6 * self._smooth + 0.4 * x
+                else:
+                    self._smooth = 0.85 * self._smooth + 0.15 * x
+
+                self.levelChanged.emit(self._smooth)
+
+            with sd.InputStream(
+                channels=1,
+                samplerate=self._samplerate,
+                blocksize=self._blocksize,
+                callback=callback,
+            ):
+                while self._running:
+                    sd.sleep(50)
+        except Exception as e:
+            print(f"[MicLevelWorker] Audio stream error: {e}")
+            self._running = False
+
+
+def icon_wheel(size=48):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    grad = QConicalGradient(size / 2, size / 2, 90)
+    for i in range(0, 361, 15):
+        grad.setColorAt(i / 360.0, QColor.fromHsvF((i % 360) / 360.0, 1.0, 1.0))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(grad)
+    p.drawEllipse(QRectF(4, 4, size - 8, size - 8))
+    p.setBrush(QColor(32, 32, 32))
+    p.drawEllipse(QRectF(size * 0.32, size * 0.32, size * 0.36, size * 0.36))
+    p.end()
+    return QIcon(pm)
+
+
+def icon_grid(size=48):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    colors = [
+        QColor(255, 0, 0), QColor(255, 255, 0), QColor(0, 255, 0),
+        QColor(0, 255, 255), QColor(0, 0, 255), QColor(255, 0, 255),
+        QColor(255, 128, 0), QColor(255, 255, 255), QColor(128, 0, 255),
+    ]
+    pad = 4
+    cell = (size - pad * 4) / 3.0
+    for i in range(9):
+        r, c = divmod(i, 3)
+        x = pad + c * (cell + pad)
+        y = pad + r * (cell + pad)
+        p.setBrush(colors[i])
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(QRectF(x, y, cell, cell), 3, 3)
+    p.end()
+    return QIcon(pm)
+
+
+def icon_mic(size=48):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(230, 230, 230), 3)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRoundedRect(QRectF(size * 0.40, size * 0.12, size * 0.20, size * 0.42), 8, 8)
+    p.drawArc(QRectF(size * 0.28, size * 0.30, size * 0.44, size * 0.42), 180 * 16, 180 * 16)
+    p.drawLine(QPointF(size * 0.5, size * 0.72), QPointF(size * 0.5, size * 0.86))
+    p.drawLine(QPointF(size * 0.36, size * 0.86), QPointF(size * 0.64, size * 0.86))
+    p.end()
+    return QIcon(pm)
+
+
+def icon_gradient(size=48):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    grad = QLinearGradient(4, size / 2, size - 4, size / 2)
+    grad.setColorAt(0.0, QColor(255, 0, 0))
+    grad.setColorAt(0.25, QColor(255, 255, 0))
+    grad.setColorAt(0.5, QColor(0, 255, 0))
+    grad.setColorAt(0.75, QColor(0, 200, 255))
+    grad.setColorAt(1.0, QColor(160, 0, 255))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(grad)
+    p.drawRoundedRect(QRectF(4, size * 0.25, size - 8, size * 0.5), 6, 6)
+    p.end()
+    return QIcon(pm)
+
+
+class ModeButton(QPushButton):
+    def __init__(self, icon, tooltip):
+        super().__init__()
+        self.setIcon(icon)
+        self.setIconSize(QSize(28, 28))
+        self.setCheckable(True)
+        self.setFixedHeight(46)
+        self.setToolTip(tooltip)
+        self.setStyleSheet(
+            "QPushButton { background:#2a2a2a; border:1px solid #3a3a3a; "
+            "border-radius:8px; }"
+            "QPushButton:hover { background:#383838; }"
+            "QPushButton:checked { background:#3d5a80; border:1px solid #6ea8ff; }"
+        )
+
+
 class ColorWheel(QWidget):
     colorChanged = pyqtSignal(int, int, int)
 
@@ -128,7 +316,6 @@ class ColorWheel(QWidget):
         self.value = 1.0
         self.rgb = (255, 255, 255)
         self._dragging = False
-
         self._wheel_img = None
         self._wheel_img_size = 0
         self._wheel_img_value = -1.0
@@ -136,11 +323,9 @@ class ColorWheel(QWidget):
     def _build_wheel_image(self, size):
         img = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
         img.fill(QColor(0, 0, 0, 0))
-
         cx = cy = size / 2.0
         outer = size / 2.0
         inner = outer * 0.75
-
         v = self.value
         for y in range(size):
             dy = y + 0.5 - cy
@@ -168,7 +353,6 @@ class ColorWheel(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         cx = self.width() / 2
         cy = self.height() / 2
         outer = min(self.width(), self.height()) / 2 - 20
@@ -226,7 +410,6 @@ class ColorWheel(QWidget):
         cy = self.height() / 2
         dx = pos.x() - cx
         dy = pos.y() - cy
-
         hue = math.degrees(math.atan2(dx, -dy)) % 360.0
         self.hue = hue
         self._recalc()
@@ -234,6 +417,14 @@ class ColorWheel(QWidget):
     def set_value(self, v):
         self.value = v
         self._recalc()
+
+    def set_rgb_external(self, r, g, b):
+        c = QColor(r, g, b)
+        h, s, v, _ = c.getHsvF()
+        self.hue = (h * 360.0) if h >= 0 else 0.0
+        self.value = max(0.0, min(1.0, v))
+        self.rgb = (r, g, b)
+        self.update()
 
     def _recalc(self):
         color = QColor.fromHsvF((self.hue % 360) / 360.0, 1.0, self.value)
@@ -258,17 +449,14 @@ class BrightnessSlider(QSlider):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         base = QColor.fromHsvF((self.wheel.hue % 360) / 360.0, 1.0, 1.0)
         grad = QLinearGradient(0, 0, self.width(), 0)
         grad.setColorAt(0.0, QColor(0, 0, 0))
         grad.setColorAt(1.0, base)
-
         rect = QRectF(4, 8, self.width() - 8, self.height() - 16)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(grad)
         p.drawRoundedRect(rect, 4, 4)
-
         ratio = self.value() / self.maximum()
         hx = rect.left() + ratio * rect.width()
         p.setBrush(QColor(255, 255, 255))
@@ -283,7 +471,9 @@ class PickerWindow(QWidget):
         self.tray_icon = tray_icon
         self.setWindowTitle("LED Color Picker by vad5m_dev")
         self.setStyleSheet("background-color: #202020;")
-        self.resize(520, 700)
+        self.resize(520, 800)
+
+        self.mode = "wheel"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -291,6 +481,51 @@ class PickerWindow(QWidget):
 
         self.wheel = ColorWheel()
         layout.addWidget(self.wheel, stretch=1)
+
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
+        self.btn_mode_wheel = ModeButton(icon_wheel(), "Color wheel")
+        self.btn_mode_grid = ModeButton(icon_grid(), "9-color palette")
+        self.btn_mode_mic = ModeButton(icon_mic(), "Microphone: color from wheel, brightness from volume")
+        self.btn_mode_gradient = ModeButton(icon_gradient(), "Rainbow gradient")
+
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+        for b in (self.btn_mode_wheel, self.btn_mode_grid,
+                  self.btn_mode_mic, self.btn_mode_gradient):
+            self.mode_group.addButton(b)
+            mode_row.addWidget(b)
+
+        self.btn_mode_wheel.setChecked(True)
+        self.btn_mode_wheel.clicked.connect(lambda: self.set_mode("wheel"))
+        self.btn_mode_grid.clicked.connect(lambda: self.set_mode("grid"))
+        self.btn_mode_mic.clicked.connect(lambda: self.set_mode("mic"))
+        self.btn_mode_gradient.clicked.connect(lambda: self.set_mode("gradient"))
+
+        layout.addLayout(mode_row)
+
+        self.grid_widget = QWidget()
+        grid = QGridLayout(self.grid_widget)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(6)
+        self._grid_colors = [
+            (255, 0, 0), (255, 165, 0), (255, 255, 0),
+            (0, 255, 0), (0, 255, 255), (0, 0, 255),
+            (128, 0, 255), (255, 0, 255), (255, 255, 255),
+        ]
+        for i, (r, g, b) in enumerate(self._grid_colors):
+            rr, cc = divmod(i, 3)
+            btn = QPushButton()
+            btn.setFixedHeight(52)
+            btn.setStyleSheet(
+                f"QPushButton {{ background: rgb({r},{g},{b}); "
+                f"border:1px solid #444; border-radius:8px; }}"
+                f"QPushButton:hover {{ border:2px solid #fff; }}"
+            )
+            btn.clicked.connect(lambda _=False, r=r, g=g, b=b: self._apply_grid_color(r, g, b))
+            grid.addWidget(btn, rr, cc)
+        self.grid_widget.setVisible(False)
+        layout.addWidget(self.grid_widget)
 
         row = QHBoxLayout()
         lbl = QLabel("Brightness:")
@@ -317,7 +552,6 @@ class PickerWindow(QWidget):
         btn_row.addWidget(self.btn_off)
         layout.addLayout(btn_row)
 
-        # Connection status label
         self.conn_label = QLabel("Connecting...")
         self.conn_label.setStyleSheet("color: #ffaa00; font-size: 13px; font-weight: bold;")
         self.conn_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -325,6 +559,7 @@ class PickerWindow(QWidget):
 
         self.status = QLabel("")
         self.status.setStyleSheet("color: #888; font-size: 12px;")
+        self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
         self._color_timer = QTimer(self)
@@ -343,14 +578,75 @@ class PickerWindow(QWidget):
         self.wheel.colorChanged.connect(self._on_color_changed)
         self.slider.valueChanged.connect(self._on_brightness_changed)
 
+        self._gradient_timer = QTimer(self)
+        self._gradient_timer.setInterval(60)
+        self._gradient_timer.timeout.connect(self._tick_gradient)
+        self._gradient_hue = 0.0
+
+        self.mic = MicLevelWorker()
+        self.mic.levelChanged.connect(self._on_mic_level)
+        if MicLevelWorker.available():
+            self.mic.start()
+            print("[MicLevelWorker] Microphone started")
+        else:
+            print(f"[MicLevelWorker] Microphone unavailable:\n{MicLevelWorker.error_message()}")
+
+        self._mic_min_brightness = 5
+        self._mic_max_brightness = 100
+        self._mic_bright_smooth = 0.0
+
         self.ble.status.connect(self.status.setText)
         self.ble.connected.connect(self._on_connection)
+
+    def set_mode(self, mode: str):
+        self.mode = mode
+        self.grid_widget.setVisible(mode == "grid")
+        self._gradient_timer.stop()
+
+        if mode == "gradient":
+            self._gradient_timer.start()
+        elif mode == "mic":
+            if not MicLevelWorker.available():
+                self.status.setText(
+                    f"Microphone unavailable.\n{MicLevelWorker.error_message()}"
+                )
+            else:
+                self.status.setText("Microphone mode active")
+
+    def _apply_grid_color(self, r, g, b):
+        self.wheel.set_rgb_external(r, g, b)
+        self._pending_rgb = (r, g, b)
+        self.ble.send_color(r, g, b)
+
+    def _tick_gradient(self):
+        self._gradient_hue = (self._gradient_hue + 4.0) % 360.0
+        c = QColor.fromHsvF(self._gradient_hue / 360.0, 1.0, 1.0)
+        r, g, b = c.red(), c.green(), c.blue()
+        self.wheel.set_rgb_external(r, g, b)
+        self.ble.send_color(r, g, b)
+
+    def _on_mic_level(self, level: float):
+        if self.mode != "mic":
+            return
+        target = self._mic_min_brightness + level * (
+            self._mic_max_brightness - self._mic_min_brightness
+        )
+        if target > self._mic_bright_smooth:
+            self._mic_bright_smooth = 0.5 * self._mic_bright_smooth + 0.5 * target
+        else:
+            self._mic_bright_smooth = 0.8 * self._mic_bright_smooth + 0.2 * target
+        v = int(max(0, min(100, self._mic_bright_smooth)))
+        if v != self.slider.value():
+            self.slider.setValue(v)
+        self.ble.send_brightness(v)
 
     def _on_color_changed(self, r, g, b):
         self._pending_rgb = (r, g, b)
         self._color_timer.start()
 
     def _on_brightness_changed(self, v):
+        if self.mode == "mic":
+            return
         self._pending_brightness = v
         self._bright_timer.start()
 
@@ -453,5 +749,11 @@ if __name__ == "__main__":
     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠉⠉⠉⠉⠀
     """
     print(ascii)
+
+    if MicLevelWorker.available():
+        print("[Sound] sounddevice + PortAudio OK")
+    else:
+        print(f"[Sound] UNAVAILABLE:\n{MicLevelWorker.error_message()}")
+
     app = App(sys.argv)
     sys.exit(app.exec())
