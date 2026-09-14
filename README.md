@@ -34,7 +34,8 @@ cd led-color-picker
 
 ### 2. Install dependencies
 ```bash
-pip install PyQt6 bleak
+pip install PyQt6 bleak sounddevice numpy
+sudo apt install libportaudio2 portaudio19-dev
 ```
 
 ### 3. Configure the device MAC address
